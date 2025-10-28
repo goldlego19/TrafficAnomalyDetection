@@ -1,0 +1,22 @@
+# Ignore YOLO model weights directory and specific yolo11 files
+Yolo-Weights/
+Yolo-Weights/yolo11*
+Yolo-Weights/*.pt
+
+# Ignore all PyTorch model files (optional, keep if you don't want any .pt/.pth in repo)
+*.pt
+*.pth
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+env/
+.venv/
+.env
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
