@@ -22,6 +22,7 @@ while cap.isOpened():
 
     if success:
         # Run YOLO11 tracking on the frame, persisting tracks between frames
+        
         result = model.track(frame, persist=True)[0]
 
         # Get the boxes and track IDs
