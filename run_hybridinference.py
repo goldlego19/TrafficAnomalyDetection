@@ -182,6 +182,17 @@ def main():
 
                 for box, track_id in zip(boxes, track_ids):
                     x1, y1, x2, y2 = map(int, box)
+
+                    # --- 1.PRIVACY BLUR ---
+                    h, w = frame.shape[:2]
+                    x1_c, y1_c = max(0, x1), max(0, y1)
+                    x2_c, y2_c = min(w, x2), min(h, y2)
+                    
+                    if y2_c > y1_c and x2_c > x1_c:
+                        car_roi = frame[y1_c:y2_c, x1_c:x2_c]
+                        blurred_car = cv2.GaussianBlur(car_roi, (51, 51), 0) 
+                        frame[y1_c:y2_c, x1_c:x2_c] = blurred_car
+                    
                     cx, cy = (x1 + x2) // 2, y2 - 5
                     
                     assigned_lane = "Unknown"
