@@ -10,9 +10,14 @@ from PIL import Image
 from config import TrafficConfig
 
 # --- CONFIGURATION ---
-FRAMES_FOLDER = "data/test/" 
+FRAMES_FOLDER = "data/marsaBridge/" 
 YOLO_MODEL_PATH = "yolo11n.pt" 
 CHECKPOINT_PATH = "model/best_resnet_model.pth"
+OUTPUT_DIR = "data/processed/"
+OUTPUT_FILE = "hybrid_dashboard_output.mp4"
+
+# Ensure output directory exists
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # --- AI THRESHOLDS ---
 CONF_THRESH = 0.80
@@ -65,8 +70,40 @@ class SpeedKalmanFilter:
         estimated = self.kf.correct(np.array([[np.float32(measured_speed)]]))
         return float(estimated[0][0])
 
+# --- ANTI-SHAKE STABILISER ---
+class StaticCameraStabiliser:
+    def __init__(self, reference_frame):
+        self.ref_gray = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2GRAY)
+        self.orb = cv2.ORB_create(nfeatures=1000)
+        self.ref_kpts, self.ref_desc = self.orb.detectAndCompute(self.ref_gray, None)
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+    def stabilise(self, frame):
+        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        curr_kpts, curr_desc = self.orb.detectAndCompute(curr_gray, None)
+
+        if self.ref_desc is None or curr_desc is None:
+            return frame
+
+        matches = self.matcher.match(curr_desc, self.ref_desc)
+        matches = sorted(matches, key=lambda x: x.distance)
+        good_matches = matches[:50] 
+
+        if len(good_matches) < 10:
+            return frame
+
+        src_pts = np.float32([curr_kpts[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([self.ref_kpts[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+        matrix, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts, cv2.RANSAC)
+
+        if matrix is not None:
+            h, w = frame.shape[:2]
+            return cv2.warpAffine(frame, matrix, (w, h))
+        return frame
+
 def main():
-    config = TrafficConfig("testcropped.mp4") 
+    config = TrafficConfig("marsaBridge.mp4") 
     config.load()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -86,7 +123,13 @@ def main():
     frame_files = sorted(glob.glob(os.path.join(FRAMES_FOLDER, '*.jpg')), 
                          key=lambda f: int(re.findall(r'\d+', os.path.basename(f))[-1]))
 
+    if not frame_files:
+        print(f"❌ ERROR: No frames found in {FRAMES_FOLDER}")
+        return
+
     first_frame = cv2.imread(frame_files[0])
+    stabiliser = StaticCameraStabiliser(first_frame)
+    
     transform_matrix = get_transform_matrix(config)
     lane_masks = build_lane_masks(first_frame.shape, config)
     
@@ -101,117 +144,164 @@ def main():
     is_accident_active = False
     flow_view = np.zeros((270, 480, 3), dtype=np.uint8)
 
-    while True:
-        for i in range(1, len(frame_files)):
-            frame = cv2.imread(frame_files[i])
-            if frame is None: continue
-            frame_count += 1
+    # --- VIDEO WRITER SETUP ---
+    main_w, main_h = 1080, 800 
+    side_w = 400
+    final_width, final_height = main_w + side_w, main_h
+    output_path = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(output_path, fourcc, 60.0, (final_width, final_height))
 
-            # --- BRANCH A: PHYSICS ---
-            curr_gray = cv2.cvtColor(cv2.resize(frame, (480, 270)), cv2.COLOR_BGR2GRAY)
-            curr_flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 0.5, 3, 3, 3, 5, 1.1, 0)
-            mag, ang = cv2.cartToPolar(curr_flow[..., 0], curr_flow[..., 1])
-            mag[240:, :] = 0; mag[mag < 3.0] = 0.0 
-            hsv_buffer[..., 0] = ang * 180 / np.pi / 2
-            hsv_buffer[..., 2] = np.clip(mag * 10.0, 0, 255).astype(np.uint8)
-            flow_view = cv2.cvtColor(hsv_buffer, cv2.COLOR_HSV2BGR)
+    print(f"🎥 Rendering {len(frame_files)} frames to {output_path}...")
+    print("This will run silently to maximise performance.")
 
-            if not inference_queue.full(): inference_queue.put(flow_view)
-            if not result_queue.empty(): ai_probability = result_queue.get()
+    # Only process the list of frames once, no infinite loop
+    for i in range(1, len(frame_files)):
+        raw_frame = cv2.imread(frame_files[i])
+        if raw_frame is None: continue
+        
+        frame = stabiliser.stabilise(raw_frame)
+        frame_count += 1
 
-            bright_pixels = np.sum(hsv_buffer[..., 2] > 50)
-            if (ai_probability > CONF_THRESH) and (bright_pixels > PIXEL_THRESH):
-                trigger_counter += 1
-            else: trigger_counter = max(0, trigger_counter - 1)
+        # --- BRANCH A: PHYSICS ---
+        curr_gray = cv2.cvtColor(cv2.resize(frame, (480, 270)), cv2.COLOR_BGR2GRAY)
+        curr_flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 0.5, 3, 3, 3, 5, 1.1, 0)
+        mag, ang = cv2.cartToPolar(curr_flow[..., 0], curr_flow[..., 1])
+        
+        # --- THE FIX: ANTI-STABILISATION ARTIFACT MASK ---
+        # Blind the Optical Flow to the outer edges to ignore black warping borders
+        border_crop = 25
+        mag[:border_crop, :] = 0    # Top edge
+        mag[-border_crop:, :] = 0   # Bottom edge
+        mag[:, :border_crop] = 0    # Left edge
+        mag[:, -border_crop:] = 0   # Right edge
+        
+        # Your existing perspective and noise filters
+        mag[240:, :] = 0
+        mag[mag < 3.0] = 0.0 
+        
+        hsv_buffer[..., 0] = ang * 180 / np.pi / 2
+        hsv_buffer[..., 2] = np.clip(mag * 10.0, 0, 255).astype(np.uint8)
+        flow_view = cv2.cvtColor(hsv_buffer, cv2.COLOR_HSV2BGR)
 
-            if trigger_counter >= REQUIRED_FRAMES:
-                is_accident_active, cooldown_counter = True, COOLDOWN_FRAMES
-            
-            if is_accident_active:
-                cooldown_counter -= 1
-                if cooldown_counter <= 0: is_accident_active, trigger_counter = False, 0
+        if not inference_queue.full(): inference_queue.put(flow_view)
+        if not result_queue.empty(): ai_probability = result_queue.get()
 
-            # --- BRANCH B: TRACKING & LANE AVERAGES ---
-            results = yolo_model.track(frame, persist=True, classes=[2, 5, 7], conf=0.15, verbose=False)
-            current_lane_speeds = defaultdict(list)
-            
-            overlay = frame.copy()
-            for lane_name, poly in config.lane_polygons.items():
-                cv2.fillPoly(overlay, [poly], (255, 255, 0))
-            cv2.addWeighted(overlay, 0.2, frame, 0.8, 0, frame)
+        bright_pixels = np.sum(hsv_buffer[..., 2] > 50)
+        if (ai_probability > CONF_THRESH) and (bright_pixels > PIXEL_THRESH):
+            trigger_counter += 1
+        else: trigger_counter = max(0, trigger_counter - 1)
 
-            if results[0].boxes.id is not None:
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                track_ids = results[0].boxes.id.int().cpu().tolist()
+        if trigger_counter >= REQUIRED_FRAMES:
+            is_accident_active, cooldown_counter = True, COOLDOWN_FRAMES
+        
+        if is_accident_active:
+            cooldown_counter -= 1
+            if cooldown_counter <= 0: is_accident_active, trigger_counter = False, 0
 
-                for box, track_id in zip(boxes, track_ids):
-                    x1, y1, x2, y2 = map(int, box)
-                    cx, cy = (x1 + x2) // 2, y2 - 5
+        # --- BRANCH B: TRACKING & LANE AVERAGES ---
+        results = yolo_model.track(frame, persist=True, classes=[2, 5, 7], conf=0.15, verbose=False)
+        current_lane_speeds = defaultdict(list)
+        
+        overlay = frame.copy()
+        for lane_name, poly in config.lane_polygons.items():
+            cv2.fillPoly(overlay, [poly], (255, 255, 0))
+        cv2.addWeighted(overlay, 0.2, frame, 0.8, 0, frame)
+
+        if results[0].boxes.id is not None:
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            track_ids = results[0].boxes.id.int().cpu().tolist()
+
+            for box, track_id in zip(boxes, track_ids):
+                x1, y1, x2, y2 = map(int, box)
+                cx, cy = (x1 + x2) // 2, y2 - 5
+                
+                assigned_lane = "Unknown"
+                for lane_name, mask in lane_masks.items():
+                    if mask[cy, cx] == 255: assigned_lane = lane_name; break
+
+                if assigned_lane == "Unknown":
+                    continue
+
+                pt = np.array([[[cx, cy]]], dtype=np.float32)
+                warped = cv2.perspectiveTransform(pt, transform_matrix)[0][0]
+                track_history[track_id].append((warped[0], warped[1], frame_count))
+                
+                if len(track_history[track_id]) > 10:
+                    o_x, o_y, o_f = track_history[track_id][0]
+                    dist = np.sqrt((warped[0]-o_x)**2 + (warped[1]-o_y)**2)
+                    time_sec = (frame_count - o_f) / 60.0
+                    speed_kmh = (dist / time_sec) * 3.6 if time_sec > 0 else 0
+
+                    if track_id not in kalman_filters: kalman_filters[track_id] = SpeedKalmanFilter()
+                    smooth_speed = int(max(0, kalman_filters[track_id].update(speed_kmh)))
                     
-                    assigned_lane = "Unknown"
-                    for lane_name, mask in lane_masks.items():
-                        if mask[cy, cx] == 255: assigned_lane = lane_name; break
+                    if smooth_speed > 5:
+                        current_lane_speeds[assigned_lane].append(smooth_speed)
 
-                    pt = np.array([[[cx, cy]]], dtype=np.float32)
-                    warped = cv2.perspectiveTransform(pt, transform_matrix)[0][0]
-                    track_history[track_id].append((warped[0], warped[1], frame_count))
-                    
-                    if len(track_history[track_id]) > 10:
-                        o_x, o_y, o_f = track_history[track_id][0]
-                        dist = np.sqrt((warped[0]-o_x)**2 + (warped[1]-o_y)**2)
-                        time_sec = (frame_count - o_f) / 60.0
-                        speed_kmh = (dist / time_sec) * 3.6 if time_sec > 0 else 0
+                    color = (0, 0, 255) if is_accident_active else (0, 255, 0)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, f"ID:{track_id} | {smooth_speed} km/h", (x1, y1-10), 0, 0.5, color, 2)
 
-                        if track_id not in kalman_filters: kalman_filters[track_id] = SpeedKalmanFilter()
-                        smooth_speed = int(max(0, kalman_filters[track_id].update(speed_kmh)))
-                        
-                        if assigned_lane != "Unknown" and smooth_speed > 5:
-                            current_lane_speeds[assigned_lane].append(smooth_speed)
+        # --- HUD ASSEMBLY ---
+        canvas = np.zeros((main_h, main_w + side_w, 3), dtype=np.uint8)
+        
+        canvas[:, :main_w] = cv2.resize(frame, (main_w, main_h))
+        
+        stats_panel = canvas[:, main_w:]
+        flow_small = cv2.resize(flow_view, (side_w, 280)) 
+        stats_panel[:280, :] = flow_small
+        
+        cv2.putText(stats_panel, "LANE PERFORMANCE", (20, 330), 0, 0.8, (255, 255, 255), 2)
+        cv2.line(stats_panel, (20, 345), (side_w-20, 345), (100, 100, 100), 1)
 
-                        color = (0, 0, 255) if is_accident_active else (0, 255, 0)
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                        cv2.putText(frame, f"{smooth_speed}km/h", (x1, y1-10), 0, 0.5, color, 2)
+        y_offset = 390
+        for lane_name in sorted(config.lane_polygons.keys()):
+            speeds = current_lane_speeds.get(lane_name, [])
+            avg = int(sum(speeds) / len(speeds)) if speeds else 0
+            count = len(speeds)
 
-            # --- HUD ASSEMBLY (TALLER & WIDER) ---
-            main_w, main_h = 1080, 800 # Increased height from 600 to 800
-            side_w = 400
-            canvas = np.zeros((main_h, main_w + side_w, 3), dtype=np.uint8)
-            
-            # Main View
-            canvas[:, :main_w] = cv2.resize(frame, (main_w, main_h))
-            
-            # Side Statistics Panel
-            stats_panel = canvas[:, main_w:]
-            flow_small = cv2.resize(flow_view, (side_w, 280)) # Larger flow view
-            stats_panel[:280, :] = flow_small
-            
-            # Lane Performance Section
-            cv2.putText(stats_panel, "LANE PERFORMANCE", (20, 330), 0, 0.8, (255, 255, 255), 2)
-            cv2.line(stats_panel, (20, 345), (side_w-20, 345), (100, 100, 100), 1)
+            if count == 0:
+                status_text = "Empty"
+                status_color = (200, 200, 200) 
+            elif avg <= 10:
+                status_text = "Severe Traffic"
+                status_color = (0, 0, 255)     
+            elif avg <= 20:
+                status_text = "Moderate"
+                status_color = (0, 165, 255)   
+            else:
+                status_text = "Good"
+                status_color = (0, 255, 0)     
 
-            y_offset = 390
-            for lane_name in sorted(config.lane_polygons.keys()):
-                speeds = current_lane_speeds.get(lane_name, [])
-                avg = int(sum(speeds) / len(speeds)) if speeds else 0
-                count = len(speeds)
-                cv2.putText(stats_panel, f"{lane_name}: {avg} km/h ({count} cars)", (20, y_offset), 0, 0.6, (0, 255, 255), 1)
-                y_offset += 50 # More vertical gap between lanes
+            cv2.putText(stats_panel, f"{lane_name}: {avg} km/h ({count} cars)", (20, y_offset), 0, 0.6, (255, 255, 255), 1)
+            cv2.putText(stats_panel, f"[{status_text}]", (280, y_offset), 0, 0.6, status_color, 2)
+            y_offset += 50
 
-            # Anomaly AI Section (Now pushed further down to avoid overlap)
-            cv2.putText(stats_panel, "Accident AI", (20, 680), 0, 0.8, (255, 255, 255), 2)
-            cv2.line(stats_panel, (20, 695), (side_w-20, 695), (100, 100, 100), 1)
-            
-            ai_color = (0, 0, 255) if is_accident_active else (0, 255, 0)
-            cv2.putText(stats_panel, f"Prob: {ai_probability:.2f}", (20, 735), 0, 0.6, ai_color, 1)
-            cv2.putText(stats_panel, f"Pixels: {bright_pixels}", (20, 770), 0, 0.6, ai_color, 1)
+        cv2.putText(stats_panel, "ANOMALY AI", (20, 680), 0, 0.8, (255, 255, 255), 2)
+        cv2.line(stats_panel, (20, 695), (side_w-20, 695), (100, 100, 100), 1)
+        
+        ai_color = (0, 0, 255) if is_accident_active else (0, 255, 0)
+        cv2.putText(stats_panel, f"Prob: {ai_probability:.2f}", (20, 735), 0, 0.6, ai_color, 1)
+        cv2.putText(stats_panel, f"Pixels: {bright_pixels}", (20, 770), 0, 0.6, ai_color, 1)
 
-            if is_accident_active:
-                cv2.rectangle(canvas, (0,0), (main_w, main_h), (0,0,255), 15)
-                cv2.putText(canvas, "ACCIDENT ALERT", (350, 400), 2, 1.5, (0,0,255), 3)
+        if is_accident_active:
+            cv2.rectangle(canvas, (0,0), (main_w, main_h), (0,0,255), 15)
+            cv2.putText(canvas, "ACCIDENT ALERT", (350, 400), 2, 1.5, (0,0,255), 3)
 
-            cv2.imshow("Hybrid Tall Dashboard", canvas)
-            prev_gray = curr_gray
-            if cv2.waitKey(1) & 0xFF == ord('q'): return
+        # WRITE TO VIDEO INSTEAD OF SHOWING
+        video_writer.write(canvas)
+        prev_gray = curr_gray
+        
+        # Progress indicator in the terminal
+        if i % 50 == 0:
+            print(f"✅ Processed {i} / {len(frame_files)} frames...")
+
+    # Shut down the background queue and save the video
+    inference_queue.put(None)
+    video_writer.release()
+    print(f"\n🎉 Rendering Complete! Video saved to: {output_path}")
 
 if __name__ == '__main__': 
     main()

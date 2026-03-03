@@ -8,7 +8,7 @@ from config import TrafficConfig
 from calibration import calibrate_physics, calibrate_lanes
 
 # --- CONFIGURATION ---
-VIDEO_PATH = "videos/testcropped.mp4" # Change this to your tracking video
+VIDEO_PATH = "videos/marsaBridge.mp4" # Change this to your tracking video
 YOLO_MODEL_PATH = "yolo11n.pt" 
 FPS = 60
 EFFECTIVE_FPS = FPS /2
@@ -145,7 +145,7 @@ def main():
 
         cv2.imshow("YOLO Tracking & Speed Engine", frame)
         
-        key = cv2.waitKey(16) & 0xFF
+        key = cv2.waitKey(1) & 0xFF
         if key == ord("q"): break
         elif key == ord("p"):
             print("\n⏸️ PAUSED. Select: [f] Full, [s] Square, [l] Lanes, [p] Resume")
